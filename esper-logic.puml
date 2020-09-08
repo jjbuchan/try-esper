@@ -1,0 +1,71 @@
+@startuml
+
+title Event Task Processing
+
+participant EventEngineManagement
+participant EventEngineProcessor
+entity EntryWindow
+entity StateCountTable
+entity StateCountSatisfiedWindow
+entity QuorumStateWindow
+database SQL
+collections Kafka
+
+group Create Task
+EventEngineManagement -> Kafka: Send TaskEvent
+Kafka --> EventEngineProcessor: Consume TaskEvent
+EventEngineProcessor->SQL: Get Task
+note over EventEngineProcessor
+Convert Task to Esper Query String
+end note
+note over EventEngineProcessor
+Compile & Deploy Query
+end note
+note right of EventEngineProcessor
+@name('{tenantId}:{taskId}')
+insert into EntryWindow
+select MetricEvaluation.generateEnrichedMetric(metric, {condition}, {stateCountMap}) from SalusEnrichedMetric(
+    monitoringSystem='salus' and
+    tenantId='my-tenant' and
+    monitorScope='remote' and
+    monitorType='http' and
+    resourceId not in (excludedResourceIds) and
+    tags('os')='linux' and tags('metric')='something') metric;
+end note
+end group
+
+group Process New Metric
+Kafka --> EventEngineProcessor: Consume UniversalMetricFrame
+note over EventEngineProcessor
+Convert UniversalMetricFrame to SalusEnrichedMetric
+end note
+EventEngineProcessor->EntryWindow: Task query inserts metric\n into initial window
+note right
+EntryWindow
+key=tenantId:resourceId:monitorId:taskId:zoneId
+end note
+EntryWindow->StateCountTable: Update current state's count
+note right StateCountTable
+StateCountTable
+key=tenantId:resourceId:monitorId:taskId:zoneId
+end note
+StateCountTable->EntryWindow: Get stateCountTable value
+opt if stateCountTable value >= stateCountMap[currentState]
+EntryWindow->StateCountSatisfiedWindow: Insert metric for zone
+note right StateCountSatisfiedWindow
+StateCountSatisfiedWindow
+key=tenantId:resourceId:monitorId:taskId:zoneId
+end note
+StateCountSatisfiedWindow->QuorumStateWindow: Evaluate new quorum state
+note right QuorumStateWindow
+QuorumStateWindow
+key=tenantId:resourceId:monitorId:taskI
+end note
+opt if quorum state changed
+EventEngineProcessor->SQL: Store state change
+EventEngineProcessor->Kafka: Send SalusStateChange event
+end opt
+end opt
+end group
+
+@enduml

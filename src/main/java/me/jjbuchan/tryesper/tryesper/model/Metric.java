@@ -1,5 +1,6 @@
 package me.jjbuchan.tryesper.tryesper.model;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -22,8 +23,11 @@ public class Metric {
   String monitorZone;
   String value;
   String metricName;
+  String state;
   Map<String, String> tags = new HashMap<>();
   List<String> excludedResourceIds = new ArrayList<>();
+  Instant timestamp = Instant.now();
+  Map<String, Integer> stateCounts = new HashMap<>();
 
   // in prod how should we treat the different tags?
   // one large map that assigns prefixes to distinguish between system/device/metric metadata?

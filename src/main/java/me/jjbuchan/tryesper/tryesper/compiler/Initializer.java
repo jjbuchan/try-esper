@@ -19,9 +19,11 @@ import com.espertech.esper.runtime.client.EPRuntimeProvider;
 import com.espertech.esper.runtime.client.EPStatement;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.stream.IntStream;
 import lombok.extern.slf4j.Slf4j;
 import me.jjbuchan.tryesper.tryesper.model.Metric;
+import me.jjbuchan.tryesper.tryesper.runtime.MetricEvaluation;
 import org.springframework.stereotype.Service;
 
 @Slf4j
@@ -34,49 +36,131 @@ public class Initializer {
   public Initializer() {
     this.config = new Configuration();
     this.config.getCommon().addEventType(Metric.class);
+    this.config.getCommon().addImport(MetricEvaluation.class);
     this.runtime = EPRuntimeProvider.getDefaultRuntime(this.config);
 
     createWindows();
+    createWindowTransitionLogic(); // need to ensure they're created in a certain order to account for dependencies / race conditions?
     addTasks();
     sendEvents();
     lookInWindow();
-  }
-
-  private void lookInWindow() {
-    final String entryWindowEvents = "@name('output') select count(*) as uniqueTaskZoneCombo from EntryWindow";
-    EPFireAndForgetQueryResult result = onDemandQuery(entryWindowEvents);
-    log.info("Result of on demand query is {}", result.getArray()[0].getUnderlying());
   }
 
   private void createWindows() {
     final String entryWindow = "create window EntryWindow.std:unique(tenantId, resourceId, monitorId, taskId, monitorZone) as "
         + "select * from Metric";
 
+    // potentially need to create a schema for any queries to this table
+    final String stateCountTable = "create table StateCountTable ("
+        + "tenantId string primary key,"
+        + "resourceId string primary key,"
+        + "monitorId string primary key,"
+        + "taskId string primary key,"
+        + "monitorZone string primary key,"
+        + "state string,"
+        + "currentCount int"
+        + ")";
+
+    final String stateCountSatisfiedWindow = "create window StateCountSatisfiedWindow.std:unique(tenantId, resourceId, monitorId, taskId, monitorZone) as "
+        + "select * from Metric";
+
     final String quorumStateWindow = "create window QuorumStateWindow.std:unique(tenantId, resourceId, monitorId, taskId) as "
         + "select * from Metric";
 
-    EPStatement entryStatement = compileAndDeploy(entryWindow);
-    entryStatement.addListener((newData, oldData, stmt, rt) -> {
-      log.info("Saw new event in EntryWindow={}", stmt);
-    });
+    compileAndDeploy(entryWindow).addListener((newData, oldData, stmt, rt) ->
+        log.info("Saw new event in EntryWindow={}", stmt));
+
+    compileAndDeploy(stateCountTable).addListener((newData, oldData, stmt, rt) ->
+        log.info("Saw new event in count table={}", stmt));
+
+    compileAndDeploy(stateCountSatisfiedWindow);
 
     compileAndDeploy(quorumStateWindow);
+  }
+
+  /**
+   * TODO: try and ensure ordering of these queries so the table logic runs before the new value is utilized
+   * http://esper.espertech.com/release-8.1.0/reference-esper/html/apicompiler.html#apicompiler-deploymentorder
+   * http://esper.espertech.com/release-8.1.0/reference-esper/html/apicompiler.html#apicompiler-concepts-dependencyresolve
+   */
+  private void createWindowTransitionLogic() {
+    String updateStateCountLogic = ""
+        + "on EntryWindow as ew "
+        + "merge into StateCountTable as cct "
+        + "where "
+        + "   ew.tenantId = cct.tenantId and "
+        + "   ew.resourceId = cct.resourceId and "
+        + "   ew.monitorId = cct.monitorId and "
+        + "   ew.taskId = cct.taskId and "
+        + "   ew.monitorZone = cct.monitorZone "
+        + "when matched and ew.state = cct.state "
+        + "   then update set cct.currentCount = cct.currentCount + 1"
+        // should we prevent currentCount from getting too high?  What happens when it maxes out?
+        + "when matched and ew.state != cct.state "
+        + "   then update set cct.currentCount = 1"
+        + "when not matched "
+        + "   then insert (tenantId, resourceId, monitorId, taskId, monitorZone, state, currentCount) "
+        + "        select tenantId, resourceId, monitorId, taskId, monitorZone, state, 1";
+
+    compileAndDeploy(updateStateCountLogic).addListener((newData, oldData, stmt, rt) ->
+        log.info("Saw new event in count table, {}", newData));
+
+    String stateCountSatisfiedLogic = "@Audit "
+        + "insert into StateCountSatisfiedWindow "
+        + "select ew.* from EntryWindow as ew "
+        + "   where "
+        + "       ew.stateCounts(ew.state) = 1 or" // this step might not actually help with any optimization
+        + "       (select cct.currentCount from StateCountTable as cct "
+        + "          where "
+        + "              ew.tenantId = cct.tenantId and "
+        + "              ew.resourceId = cct.resourceId and "
+        + "              ew.monitorId = cct.monitorId and "
+        + "              ew.taskId = cct.taskId and "
+        + "              ew.monitorZone = cct.monitorZone"
+        + "       ) >= ew.stateCounts(ew.state)"; // can we guarantee order of updates better?
+
+    compileAndDeploy(stateCountSatisfiedLogic).addListener((newData, oldData, stmt, rt) ->
+        log.info("Saw new event in state count satisfied window, {}", newData));
+
+    // need to disregard old events and only care about new ones then see if quorum has been met
+    // can do timestamp comparison in here?  would have to get newest event in window (sort) and then filter all others that dont match
+    // then pass those to quorum method?
+    String quorumStateLogic = ""
+        + "insert into QuorumstateWindow "
+        + "select csw.* from StateCountSatisfiedWindow as csw "
+        + "";
+  }
+
+  private void lookInWindow() {
+    final String entryWindowEvents = "@name('output') select count(*) as uniqueTaskZoneCombo from EntryWindow";
+    EPFireAndForgetQueryResult result = onDemandQuery(entryWindowEvents);
+    log.info("Result of on demand query is {}", result.getArray()[0].getUnderlying());
+
+    final String stateCountTable = "@name('output') select tenantId, resourceId, monitorId, "
+        + "taskId, monitorZone, state, currentCount from StateCountTable";
+    EPFireAndForgetQueryResult result2 = onDemandQuery(stateCountTable);
+    log.info("StateCountTable contains the following values");
+    for (int i =0; i< result2.getArray().length; i++) {
+      Map<String, String> entry = (Map<String, String>) result2.getArray()[i].getUnderlying();
+      log.info("{}. {}:{}:{}:{}:{} {}={}", i,
+          entry.get("tenantId"), entry.get("resourceId"), entry.get("monitorId"),
+          entry.get("taskId"), entry.get("monitorZone"), entry.get("state"),
+          entry.get("currentCount"));
+    }
   }
 
   private void addTasks() {
     String query = ""
         + "@name('my-statement') "
         + "insert into EntryWindow "
-        + "select * from Metric("
+        + "select MetricEvaluation.populateStateCounts(metric, 1, 2, 3) from Metric("
         + "tenantId='my-tenant' and "
         + "monitorScope='remote' and "
         + "monitorType='http' and "
         + "resourceId not in (excludedResourceIds) and "
-        + "tags('os')='linux' and tags('metric')='something')";
+        + "tags('os')='linux' and tags('metric')='something') metric";
 
-    EPStatement statement = compileAndDeploy(query);
-
-    statement.addListener((newData, oldData, stmt, rt) -> {
+    compileAndDeploy(query).addListener((newData, oldData, stmt, rt) -> {
       String tenantId = (String) newData[0].get("tenantId");
       String resourceId = (String) newData[0].get("resourceId");
       String monitorId = (String) newData[0].get("monitorId");
@@ -92,12 +176,13 @@ public class Initializer {
     // send {metricRange} dupes of m1
     // send {metricRange} dupes of m2
     // send {metricRange} uniques of a valid metric
+    // provide a random state for each to test the state count table logic
     IntStream.range(0, metricRange).forEach(i -> {
       log.info("sending valid metric 1-{}", i);
-      runtime.getEventService().sendEventBean(m1, "Metric");
+      runtime.getEventService().sendEventBean(m1.setState(generateState()), "Metric");
       log.info("sending valid metric 2-{}", i);
-      runtime.getEventService().sendEventBean(m2, "Metric");
-      runtime.getEventService().sendEventBean(buildMetric(), "Metric");
+      runtime.getEventService().sendEventBean(m2.setState(generateState()), "Metric");
+      runtime.getEventService().sendEventBean(buildMetric().setState(generateState()), "Metric");
     });
 
     // then send 3 invalid metric and 1 valid
@@ -119,6 +204,7 @@ public class Initializer {
       CompilerArguments args = new CompilerArguments(config);
       args.getPath().add(runtime.getRuntimePath());
       args.getOptions().setAccessModifierNamedWindow(env -> NameAccessModifier.PUBLIC); // All named windows are visibile
+      args.getOptions().setAccessModifierTable(env -> NameAccessModifier.PUBLIC);
       EPCompiled compiled = EPCompilerProvider.getCompiler().compile(epl, args);
       EPDeployment deployment = runtime.getDeploymentService().deploy(compiled);
       return deployment.getStatements()[0];
@@ -136,14 +222,10 @@ public class Initializer {
       CompilerArguments args = new CompilerArguments(config);
       args.getPath().add(runtime.getRuntimePath());
       args.getOptions().setAccessModifierNamedWindow(env -> NameAccessModifier.PUBLIC);
+      args.getOptions().setAccessModifierTable(env -> NameAccessModifier.PUBLIC);
       EPCompiled compiled = EPCompilerProvider.getCompiler().compileQuery(epl, args);
       EPFireAndForgetPreparedQuery onDemandQuery = runtime.getFireAndForgetService().prepareQuery(compiled);
-      EPFireAndForgetQueryResult result = onDemandQuery.execute();
-      if (result.getArray().length != 1) {
-        throw new RuntimeException(
-            String.format("Failed to run query, expected a single row returned from query=%s", epl));
-      }
-      return result;
+      return onDemandQuery.execute();
     } catch (EPCompileException e) {
       log.error("Failed to compile query={}", epl);
       throw new RuntimeException(e);
@@ -195,8 +277,12 @@ public class Initializer {
             "os", "linux",
             "metric", "something"))
         .setExcludedResourceIds(List.of("r1", "r2", "r3"))
-        .setMonitorZone("dfw");
+        .setMonitorZone("dfw")
+        .setState(generateState());
+  }
 
+  private static String generateState() {
+    return List.of("critical", "ok").get(new Random().nextInt(2));
   }
 
 }
