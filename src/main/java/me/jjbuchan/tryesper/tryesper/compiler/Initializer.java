@@ -195,6 +195,8 @@ public class Initializer {
     runtime.getEventService().sendEventBean(buildMetricTagsPartialMatched(), "Metric");
     log.info("sending tags match 1");
     runtime.getEventService().sendEventBean(buildMetricExtraTags(), "Metric");
+    log.info("sendings metric with empty tags map");
+    runtime.getEventService().sendEventBean(buildMetricNoTags(), "Metric");
 
     // total unqiue valid metrics should be {metricRange} + 3
   }
@@ -255,6 +257,10 @@ public class Initializer {
         "os", "linux",
         "metric", "something",
         "another", "one"));
+  }
+
+  private static Metric buildMetricNoTags() {
+    return buildMetric("my-tenant", randomAlphanumeric(10), Map.of());
   }
 
 
